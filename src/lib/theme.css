@@ -101,13 +101,26 @@ a {
 }
 
 .brand {
+	display: flex;
+	align-items: center;
+	gap: 0.75rem;
 	font-size: 1.35rem;
-}
-
-.brand {
 	letter-spacing: 0.18em;
 	font-weight: 700;
 	color: var(--gold);
+}
+
+.brand-logo {
+	width: 40px;
+	height: 40px;
+	border-radius: 10px;
+	flex-shrink: 0;
+	object-fit: cover;
+	background: #111;
+}
+
+.brand-text {
+	min-width: 0;
 }
 
 .brand small {

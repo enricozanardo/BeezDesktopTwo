@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import favicon from '#lib/assets/favicon.svg';
+	import logo from '#lib/assets/beez-logo.png';
 	import {
 		appVersion,
 		live,
@@ -76,15 +76,18 @@
 </script>
 
 <svelte:head>
-	<link rel="icon" href={favicon} />
+	<link rel="icon" type="image/png" href={logo} />
 	<title>Beez Desktop Two v{version}</title>
 </svelte:head>
 
 <div class="shell">
 	<aside class="sidebar">
 		<div class="brand">
-			BEEZ
-			<small>Desktop Two v{version}</small>
+			<img class="brand-logo" src={logo} alt="Beez" width="40" height="40" />
+			<div class="brand-text">
+				BEEZ
+				<small>Desktop Two v{version}</small>
+			</div>
 		</div>
 		<nav>
 			{#each links as link}
