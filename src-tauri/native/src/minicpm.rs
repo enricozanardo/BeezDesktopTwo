@@ -101,6 +101,65 @@ fn llama_bin() -> Option<String> {
         .map(|p| p.display().to_string())
 }
 
+/// Drop AppImage (and similar) mount entries from `LD_LIBRARY_PATH`.
+///
+/// The Linux AppImage sets `LD_LIBRARY_PATH` to its bundled libs (often OpenSSL
+/// 3.0.x). Host-linked `llama-server` then mixes that `libcrypto` with the
+/// system `libssl` and fails with `OPENSSL_3.x not found` on newer distros.
+fn filter_ld_library_path(raw: Option<&str>, appdir: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let filtered: Vec<&str> = raw
+        .split(':')
+        .filter(|p| {
+            if p.is_empty() {
+                return false;
+            }
+            if p.starts_with("/tmp/.mount_") {
+                return false;
+            }
+            if let Some(ad) = appdir {
+                if !ad.is_empty() && (*p == ad || p.starts_with(&format!("{ad}/"))) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered.join(":"))
+    }
+}
+
+/// Ensure a host-linked child (llama-server) does not inherit AppImage OpenSSL.
+fn apply_clean_library_path(cmd: &mut std::process::Command, bin: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let appdir = std::env::var("APPDIR").ok();
+        let current = std::env::var("LD_LIBRARY_PATH").ok();
+        let mut path = filter_ld_library_path(current.as_deref(), appdir.as_deref())
+            .unwrap_or_default();
+        if let Some(dir) = bin.parent() {
+            let dir_s = dir.display().to_string();
+            if path.is_empty() {
+                path = dir_s;
+            } else if !path.split(':').any(|p| p == dir_s) {
+                path = format!("{dir_s}:{path}");
+            }
+        }
+        if path.is_empty() {
+            cmd.env_remove("LD_LIBRARY_PATH");
+        } else {
+            cmd.env("LD_LIBRARY_PATH", path);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (cmd, bin);
+    }
+}
+
 fn snapshot(lock: &Lazy<Mutex<DownloadState>>) -> Value {
     match lock.lock().ok() {
         Some(s) => json!({
@@ -369,7 +428,9 @@ pub fn start_server() -> Value {
         Ok(f) => f,
         Err(e) => return json!({"ok": false, "error": e.to_string()}),
     };
-    let child = std::process::Command::new(bin)
+    let bin_path = PathBuf::from(bin);
+    let mut command = std::process::Command::new(&bin_path);
+    command
         .args([
             "-m",
             gguf,
@@ -382,8 +443,9 @@ pub fn start_server() -> Value {
             "--jinja",
         ])
         .stdout(std::process::Stdio::from(logf))
-        .stderr(std::process::Stdio::from(errf))
-        .spawn();
+        .stderr(std::process::Stdio::from(errf));
+    apply_clean_library_path(&mut command, &bin_path);
+    let child = command.spawn();
     match child {
         Ok(c) => *SERVER.lock().unwrap() = Some(c),
         Err(e) => return json!({"ok": false, "error": e.to_string()}),
@@ -477,5 +539,44 @@ pub fn chat(messages: &Value, max_tokens: u32) -> Value {
             "error": format!("minicpm_http_{code}: {}", text.chars().take(300).collect::<String>())
         }),
         Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_ld_library_path;
+
+    #[test]
+    fn strips_appimage_mount_entries() {
+        let raw = Some(
+            "/tmp/.mount_beezdeefJpbF/usr/lib/:/usr/lib64:/tmp/.mount_other/lib:",
+        );
+        assert_eq!(
+            filter_ld_library_path(raw, None).as_deref(),
+            Some("/usr/lib64")
+        );
+    }
+
+    #[test]
+    fn strips_appdir_prefix_entries() {
+        let appdir = Some("/tmp/.mount_beezdeefJpbF");
+        let raw = Some(
+            "/tmp/.mount_beezdeefJpbF/usr/lib/:/home/user/.local/lib:/tmp/.mount_beezdeefJpbF",
+        );
+        assert_eq!(
+            filter_ld_library_path(raw, appdir).as_deref(),
+            Some("/home/user/.local/lib")
+        );
+    }
+
+    #[test]
+    fn clears_when_only_appimage_paths_remain() {
+        let raw = Some("/tmp/.mount_beezdeefJpbF/usr/lib/:/tmp/.mount_beezdeefJpbF/usr/lib64/");
+        assert_eq!(filter_ld_library_path(raw, None), None);
+    }
+
+    #[test]
+    fn leaves_unset_path_alone() {
+        assert_eq!(filter_ld_library_path(None, Some("/tmp/.mount_x")), None);
     }
 }
