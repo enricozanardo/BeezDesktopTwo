@@ -506,6 +506,50 @@ pub fn reset() -> Value {
     json!({"ok": true, "removed": removed, "status": status()})
 }
 
+/// Prefer visible assistant text; MiniCPM-5 may put the whole reply in
+/// `reasoning_content` when the chat template runs with thinking enabled.
+fn extract_assistant_text(data: &Value) -> String {
+    let message = data.pointer("/choices/0/message");
+    let content = message
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if !content.is_empty() {
+        return strip_think_tags(content);
+    }
+    let reasoning = message
+        .and_then(|m| m.get("reasoning_content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if reasoning.is_empty() {
+        return String::new();
+    }
+    // Last non-empty line is usually the actual answer after a long think.
+    reasoning
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .last()
+        .unwrap_or(reasoning)
+        .to_string()
+}
+
+fn strip_think_tags(text: &str) -> String {
+    if let Some(rest) = text.rsplit_once("</think>") {
+        let after = rest.1.trim();
+        if !after.is_empty() {
+            return after.to_string();
+        }
+    }
+    text
+        .replace("<think>", "")
+        .replace("</think>", "")
+        .trim()
+        .to_string()
+}
+
 pub fn chat(messages: &Value, max_tokens: u32) -> Value {
     let st = status();
     if st.get("running").and_then(|v| v.as_bool()) != Some(true) {
@@ -514,12 +558,15 @@ pub fn chat(messages: &Value, max_tokens: u32) -> Value {
             return started;
         }
     }
+    // Disable MiniCPM thinking mode so short questions get a normal `content`
+    // field instead of burning max_tokens on reasoning_content alone.
     let body = json!({
         "model": "MiniCPM5-2B",
         "messages": messages,
-        "temperature": 1.0,
+        "temperature": 0.7,
         "top_p": 0.95,
         "max_tokens": max_tokens,
+        "chat_template_kwargs": { "enable_thinking": false },
     });
     match http::post_json(
         &format!("http://127.0.0.1:{PORT}/v1/chat/completions"),
@@ -527,11 +574,14 @@ pub fn chat(messages: &Value, max_tokens: u32) -> Value {
         180,
     ) {
         Ok((200, data, _)) => {
-            let content = data
-                .pointer("/choices/0/message/content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let content = extract_assistant_text(&data);
+            if content.is_empty() {
+                return json!({
+                    "ok": false,
+                    "error": "minicpm_empty_answer: model returned no visible text",
+                    "raw": data
+                });
+            }
             json!({"ok": true, "answer": content, "cost": 0, "sources": [], "raw": data})
         }
         Ok((code, _, text)) => json!({
@@ -544,7 +594,8 @@ pub fn chat(messages: &Value, max_tokens: u32) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_ld_library_path;
+    use super::{extract_assistant_text, filter_ld_library_path, strip_think_tags};
+    use serde_json::json;
 
     #[test]
     fn strips_appimage_mount_entries() {
@@ -578,5 +629,39 @@ mod tests {
     #[test]
     fn leaves_unset_path_alone() {
         assert_eq!(filter_ld_library_path(None, Some("/tmp/.mount_x")), None);
+    }
+
+    #[test]
+    fn prefers_message_content() {
+        let data = json!({
+            "choices": [{
+                "message": {
+                    "content": "12",
+                    "reasoning_content": "thinking about 2*6"
+                }
+            }]
+        });
+        assert_eq!(extract_assistant_text(&data), "12");
+    }
+
+    #[test]
+    fn falls_back_to_reasoning_when_content_empty() {
+        let data = json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "reasoning_content": "2 times 6 is 12.\n\n12"
+                }
+            }]
+        });
+        assert_eq!(extract_assistant_text(&data), "12");
+    }
+
+    #[test]
+    fn strips_think_wrapper_from_content() {
+        assert_eq!(
+            strip_think_tags("<think>\nscratch\n</think>\n\n2 × 6 = 12"),
+            "2 × 6 = 12"
+        );
     }
 }
